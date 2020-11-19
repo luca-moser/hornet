@@ -273,7 +273,7 @@ type SnapshotConfig struct {
 // CLIFlags returns the config as CLI flags.
 func (snapshotConfig *SnapshotConfig) CLIFlags() []string {
 	return []string{
-		fmt.Sprintf("--%s=%s", snapshot.CfgSnapshotsPath, snapshotConfig.SnapshotFilePath),
+		fmt.Sprintf("--%s=%s", snapshot.CfgSnapshotsFullPath, snapshotConfig.SnapshotFilePath),
 	}
 }
 

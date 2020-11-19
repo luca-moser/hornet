@@ -18,7 +18,9 @@ const (
 	// interval, in milestones, at which snapshot files are created if the ledger is not fully synchronized
 	CfgSnapshotsIntervalUnsynced = "snapshots.intervalUnsynced"
 	// path to the snapshot file
-	CfgSnapshotsPath = "snapshots.path"
+	CfgSnapshotsFullPath = "snapshots.fullPath"
+	// path to the delta snapshot file
+	CfgSnapshotsDeltaPath = "snapshots.deltaPath"
 	// URL to load the snapshot file from
 	CfgSnapshotsDownloadURLs = "snapshots.downloadURLs"
 )
@@ -32,7 +34,8 @@ var params = &node.PluginParams{
 			fs.Int(CfgSnapshotsDepth, 50, "the depth, respectively the starting point, at which a snapshot of the ledger is generated")
 			fs.Int(CfgSnapshotsIntervalSynced, 50, "interval, in milestones, at which snapshot files are created if the ledger is fully synchronized")
 			fs.Int(CfgSnapshotsIntervalUnsynced, 1000, "interval, in milestones, at which snapshot files are created if the ledger is not fully synchronized")
-			fs.String(CfgSnapshotsPath, "snapshots/mainnet/export.bin", "path to the snapshot file")
+			fs.String(CfgSnapshotsFullPath, "snapshots/mainnet/export.bin", "path to the snapshot file")
+			fs.String(CfgSnapshotsDeltaPath, "snapshots/mainnet/delta_export.bin", "path to the delta snapshot file")
 			fs.StringSlice(CfgSnapshotsDownloadURLs, []string{}, "URLs to load the snapshot file from. Provide multiple URLs as fall back sources")
 			return fs
 		}(),

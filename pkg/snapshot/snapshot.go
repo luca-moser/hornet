@@ -156,7 +156,7 @@ func (s *Snapshot) getMilestoneParentMessageIDs(milestoneIndex milestone.Index, 
 			defer cachedMsgMeta.Release(true) // msg -1
 			// collect all msg that were referenced by that milestone or newer
 			referenced, at := cachedMsgMeta.GetMetadata().GetReferenced()
-			return (referenced && at >= milestoneIndex), nil
+			return referenced && at >= milestoneIndex, nil
 		},
 		// consumer
 		func(cachedMsgMeta *storage.CachedMetadata) error { // msg +1
@@ -276,7 +276,7 @@ func (s *Snapshot) checkSnapshotLimits(targetIndex milestone.Index, snapshotInfo
 		return errors.Wrapf(ErrNotEnoughHistory, "minimum solid index: %d, actual solid index: %d", s.solidEntryPointCheckThresholdFuture+1, solidMilestoneIndex)
 	}
 
-	minimumIndex := milestone.Index(s.solidEntryPointCheckThresholdPast + 1)
+	minimumIndex := s.solidEntryPointCheckThresholdPast + 1
 	maximumIndex := solidMilestoneIndex - s.solidEntryPointCheckThresholdFuture
 
 	if checkSnapshotIndex && minimumIndex < snapshotInfo.SnapshotIndex+1 {
@@ -287,15 +287,12 @@ func (s *Snapshot) checkSnapshotLimits(targetIndex milestone.Index, snapshotInfo
 		minimumIndex = snapshotInfo.PruningIndex + 1 + s.solidEntryPointCheckThresholdPast
 	}
 
-	if minimumIndex > maximumIndex {
+	switch {
+	case minimumIndex > maximumIndex:
 		return errors.Wrapf(ErrNotEnoughHistory, "minimum index (%d) exceeds maximum index (%d)", minimumIndex, maximumIndex)
-	}
-
-	if targetIndex > maximumIndex {
+	case targetIndex > maximumIndex:
 		return errors.Wrapf(ErrTargetIndexTooNew, "maximum: %d, actual: %d", maximumIndex, targetIndex)
-	}
-
-	if targetIndex < minimumIndex {
+	case targetIndex < minimumIndex:
 		return errors.Wrapf(ErrTargetIndexTooOld, "minimum: %d, actual: %d", minimumIndex, targetIndex)
 	}
 
@@ -308,15 +305,22 @@ func (s *Snapshot) setIsSnapshotting(value bool) {
 	s.statusLock.Unlock()
 }
 
-// CreateSnapshot creates a snapshot for the given target milestone index.
-func (s *Snapshot) CreateSnapshot(targetIndex milestone.Index, filePath string, writeToDatabase bool, abortSignal <-chan struct{}) error {
+// CreateFullSnapshot creates a full snapshot for the given target milestone index.
+func (s *Snapshot) CreateFullSnapshot(targetIndex milestone.Index, filePath string, writeToDatabase bool, abortSignal <-chan struct{}) error {
 	s.snapshotLock.Lock()
 	defer s.snapshotLock.Unlock()
 	return s.createFullSnapshotWithoutLocking(targetIndex, filePath, writeToDatabase, abortSignal)
 }
 
-func (s *Snapshot) createFullSnapshotWithoutLocking(targetIndex milestone.Index, filePath string, writeToDatabase bool, abortSignal <-chan struct{}) error {
-	s.log.Infof("creating snapshot for targetIndex %d", targetIndex)
+// CreateDeltaSnapshot creates a delta snapshot for the given target milestone index.
+func (s *Snapshot) CreateDeltaSnapshot(targetIndex milestone.Index, filePath string, writeToDatabase bool, abortSignal <-chan struct{}) error {
+	s.snapshotLock.Lock()
+	defer s.snapshotLock.Unlock()
+	return s.createDeltaSnapshotWithoutLocking(targetIndex, filePath, writeToDatabase, abortSignal)
+}
+
+func (s *Snapshot) createDeltaSnapshotWithoutLocking(targetIndex milestone.Index, filePath string, writeToDatabase bool, abortSignal <-chan struct{}) error {
+	s.log.Infof("creating delta snapshot for targetIndex %d", targetIndex)
 	ts := time.Now()
 
 	snapshotInfo := s.storage.GetSnapshotInfo()
@@ -337,94 +341,46 @@ func (s *Snapshot) createFullSnapshotWithoutLocking(targetIndex milestone.Index,
 	}
 	defer cachedTargetMilestone.Release(true) // milestone -1
 
-	header := &FileHeader{
-		Version:           SupportedFormatVersion,
-		Type:              Full,
-		NetworkID:         snapshotInfo.NetworkID,
-		SEPMilestoneIndex: targetIndex,
-	}
+}
 
-	// build temp file path
-	filePathTmp := filePath + "_tmp"
-	_ = os.Remove(filePathTmp)
+// returns a producer which produces solid entry points.
+func (s *Snapshot) sepGenerator(targetIndex milestone.Index, abortSignal <-chan struct{}) SEPProducerFunc {
+	sepProducerChan := make(chan *hornet.MessageID)
+	sepProducerErrorChan := make(chan error)
 
-	// create temp file
-	lsFile, err := os.OpenFile(filePathTmp, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		return fmt.Errorf("unable to create tmp snapshot file: %w", err)
-	}
+	go func() {
+		// calculate solid entry points for the target index
+		if err := s.forEachSolidEntryPoint(targetIndex, abortSignal, func(sep *solidEntryPoint) bool {
+			sepProducerChan <- sep.messageID
+			return true
+		}); err != nil {
+			sepProducerErrorChan <- err
+		}
 
-	s.utxo.ReadLockLedger()
-	defer s.utxo.ReadUnlockLedger()
+		close(sepProducerChan)
+		close(sepProducerErrorChan)
+	}()
 
-	ledgerMilestoneIndex, err := s.utxo.ReadLedgerIndexWithoutLocking()
-	if err != nil {
-		return fmt.Errorf("unable to read current ledger index: %w", err)
-	}
-
-	cachedMilestone := s.storage.GetCachedMilestoneOrNil(ledgerMilestoneIndex)
-	if cachedMilestone == nil {
-		return errors.Wrapf(ErrCritical, "milestone (%d) not found!", ledgerMilestoneIndex)
-	}
-
-	header.LedgerMilestoneIndex = ledgerMilestoneIndex
-
-	cachedMilestone.Release(true)
-
-	//
-	// solid entry points
-	//
-	solidEntryPointProducerChan := make(chan *hornet.MessageID)
-	solidEntryPointProducerErrorChan := make(chan error)
-
-	solidEntryPointProducerFunc := func() (*hornet.MessageID, error) {
+	return func() (*hornet.MessageID, error) {
 		select {
-		case err, ok := <-solidEntryPointProducerErrorChan:
+		case err, ok := <-sepProducerErrorChan:
 			if !ok {
 				return nil, nil
 			}
 			return nil, err
-		case solidEntryPointMessageID, ok := <-solidEntryPointProducerChan:
+		case solidEntryPointMessageID, ok := <-sepProducerChan:
 			if !ok {
 				return nil, nil
 			}
 			return solidEntryPointMessageID, nil
 		}
 	}
+}
 
-	go func() {
-		// calculate solid entry points for the target index
-		if err := s.forEachSolidEntryPoint(targetIndex, abortSignal, func(sep *solidEntryPoint) bool {
-			solidEntryPointProducerChan <- sep.messageID
-			return true
-		}); err != nil {
-			solidEntryPointProducerErrorChan <- err
-		}
-
-		close(solidEntryPointProducerChan)
-		close(solidEntryPointProducerErrorChan)
-	}()
-
-	//
-	// unspent outputs
-	//
+// returns a producer which produces unspent outputs which exist for current solid milestone.
+func (s *Snapshot) utxoProducer() OutputProducerFunc {
 	outputProducerChan := make(chan *Output)
 	outputProducerErrorChan := make(chan error)
-
-	outputProducerFunc := func() (*Output, error) {
-		select {
-		case err, ok := <-outputProducerErrorChan:
-			if !ok {
-				return nil, nil
-			}
-			return nil, err
-		case output, ok := <-outputProducerChan:
-			if !ok {
-				return nil, nil
-			}
-			return output, nil
-		}
-	}
 
 	go func() {
 		if err := s.utxo.ForEachUnspentOutputWithoutLocking(func(output *utxo.Output) bool {
@@ -438,26 +394,26 @@ func (s *Snapshot) createFullSnapshotWithoutLocking(targetIndex milestone.Index,
 		close(outputProducerErrorChan)
 	}()
 
-	//
-	// milestone diffs
-	//
-	milestoneDiffProducerChan := make(chan *MilestoneDiff)
-	milestoneDiffProducerErrorChan := make(chan error)
-
-	milestoneDiffProducerFunc := func() (*MilestoneDiff, error) {
+	return func() (*Output, error) {
 		select {
-		case err, ok := <-milestoneDiffProducerErrorChan:
+		case err, ok := <-outputProducerErrorChan:
 			if !ok {
 				return nil, nil
 			}
 			return nil, err
-		case msDiff, ok := <-milestoneDiffProducerChan:
+		case output, ok := <-outputProducerChan:
 			if !ok {
 				return nil, nil
 			}
-			return msDiff, nil
+			return output, nil
 		}
 	}
+}
+
+// returns a producer which produces milestone diffs from the given target milestone back to the target index.
+func (s *Snapshot) milestoneDiffGenerator(ledgerMilestoneIndex milestone.Index, targetIndex milestone.Index) MilestoneDiffProducerFunc {
+	milestoneDiffProducerChan := make(chan *MilestoneDiff)
+	milestoneDiffProducerErrorChan := make(chan error)
 
 	go func() {
 		// targetIndex should not be included in the snapshot, because we only need the diff of targetIndex+1 to calculate the ledger index of targetIndex
@@ -474,37 +430,153 @@ func (s *Snapshot) createFullSnapshotWithoutLocking(targetIndex milestone.Index,
 			var consumedOutputs []*Spent
 
 			for _, output := range newOutputs {
-				createdOutputs = append(createdOutputs, &Output{MessageID: *output.MessageID(), OutputID: *output.OutputID(), Address: output.Address(), Amount: output.Amount()})
+				createdOutputs = append(createdOutputs, &Output{
+					MessageID: *output.MessageID(), OutputID: *output.OutputID(),
+					Address: output.Address(), Amount: output.Amount()})
 			}
 
 			for _, spent := range newSpents {
-				consumedOutputs = append(consumedOutputs, &Spent{Output: Output{MessageID: *spent.MessageID(), OutputID: *spent.OutputID(), Address: spent.Address(), Amount: spent.Amount()}, TargetTransactionID: *spent.TargetTransactionID()})
+				consumedOutputs = append(consumedOutputs, &Spent{Output: Output{
+					MessageID: *spent.MessageID(), OutputID: *spent.OutputID(),
+					Address: spent.Address(), Amount: spent.Amount()},
+					TargetTransactionID: *spent.TargetTransactionID()},
+				)
 			}
 
-			milestoneDiffProducerChan <- &MilestoneDiff{MilestoneIndex: msIndex, Created: createdOutputs, Consumed: consumedOutputs}
+			milestoneDiffProducerChan <- &MilestoneDiff{
+				MilestoneIndex: msIndex, Created: createdOutputs,
+				Consumed: consumedOutputs,
+			}
 		}
 
 		close(milestoneDiffProducerChan)
 		close(milestoneDiffProducerErrorChan)
 	}()
 
-	if err := StreamSnapshotDataTo(lsFile, uint64(ts.Unix()), header, solidEntryPointProducerFunc, outputProducerFunc, milestoneDiffProducerFunc); err != nil {
-		_ = lsFile.Close()
+	return func() (*MilestoneDiff, error) {
+		select {
+		case err, ok := <-milestoneDiffProducerErrorChan:
+			if !ok {
+				return nil, nil
+			}
+			return nil, err
+		case msDiff, ok := <-milestoneDiffProducerChan:
+			if !ok {
+				return nil, nil
+			}
+			return msDiff, nil
+		}
+	}
+}
+
+// reads out the index of the milestone which currently represents the ledger state.
+func (s *Snapshot) readLedgerMilestoneIndex() (milestone.Index, error) {
+	ledgerMilestoneIndex, err := s.utxo.ReadLedgerIndexWithoutLocking()
+	if err != nil {
+		return 0, fmt.Errorf("unable to read current ledger index: %w", err)
+	}
+
+	cachedMilestone := s.storage.GetCachedMilestoneOrNil(ledgerMilestoneIndex)
+	if cachedMilestone == nil {
+		return 0, errors.Wrapf(ErrCritical, "milestone (%d) not found!", ledgerMilestoneIndex)
+	}
+	cachedMilestone.Release(true)
+	return ledgerMilestoneIndex, nil
+}
+
+// creates the temp file into which to write the snapshot data into.
+func (s *Snapshot) createTempFile(filePath string) (*os.File, string, error) {
+	filePathTmp := filePath + "_tmp"
+	_ = os.Remove(filePathTmp)
+
+	lsFile, err := os.OpenFile(filePathTmp, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return nil, "", fmt.Errorf("unable to create tmp snapshot file: %w", err)
+	}
+	return lsFile, filePathTmp, nil
+}
+
+// renames the given temp file to the final file name.
+func (s *Snapshot) renameTempFile(tempFile *os.File, tempFilePath string, filePath string) error {
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("unable to close snapshot file: %w", err)
+	}
+	if err := os.Rename(tempFilePath, filePath); err != nil {
+		return fmt.Errorf("unable to rename temp snapshot file: %w", err)
+	}
+	return nil
+}
+
+// returns the timestamp of the target milestone.
+func (s *Snapshot) readTargetMilestoneTimestamp(targetIndex milestone.Index) (time.Time, error) {
+	cachedTargetMilestone := s.storage.GetCachedMilestoneOrNil(targetIndex) // milestone +1
+	if cachedTargetMilestone == nil {
+		return time.Time{}, errors.Wrapf(ErrCritical, "target milestone (%d) not found", targetIndex)
+	}
+	ts := cachedTargetMilestone.GetMilestone().Timestamp
+	cachedTargetMilestone.Release(true) // milestone -1
+	return ts, nil
+}
+
+// creates a full snapshot file by streaming data from the database into a snapshot file.
+func (s *Snapshot) createFullSnapshotWithoutLocking(targetIndex milestone.Index, filePath string, writeToDatabase bool, abortSignal <-chan struct{}) error {
+	s.log.Infof("creating full snapshot for targetIndex %d", targetIndex)
+	ts := time.Now()
+
+	s.setIsSnapshotting(true)
+	defer s.setIsSnapshotting(false)
+
+	s.utxo.ReadLockLedger()
+	defer s.utxo.ReadUnlockLedger()
+
+	snapshotInfo := s.storage.GetSnapshotInfo()
+	if snapshotInfo == nil {
+		return errors.Wrap(ErrCritical, "no snapshot info found")
+	}
+
+	targetMsTimestamp, err := s.readTargetMilestoneTimestamp(targetIndex)
+	if err != nil {
+		return err
+	}
+
+	if err := s.checkSnapshotLimits(targetIndex, snapshotInfo, writeToDatabase); err != nil {
+		return err
+	}
+
+	header := &FileHeader{
+		Version:           SupportedFormatVersion,
+		Type:              Full,
+		NetworkID:         snapshotInfo.NetworkID,
+		SEPMilestoneIndex: targetIndex,
+	}
+
+	header.LedgerMilestoneIndex, err = s.readLedgerMilestoneIndex()
+	if err != nil {
+		return err
+	}
+
+	snapshotFile, tempFilePath, err := s.createTempFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	// stream data into full snapshot file
+	sepProducer := s.sepGenerator(targetIndex, abortSignal)
+	utxoProducer := s.utxoProducer()
+	milestoneDiffProducer := s.milestoneDiffGenerator(header.LedgerMilestoneIndex, targetIndex)
+	if err := StreamSnapshotDataTo(snapshotFile, uint64(ts.Unix()), header, sepProducer, utxoProducer, milestoneDiffProducer); err != nil {
+		_ = snapshotFile.Close()
 		return fmt.Errorf("couldn't generate snapshot file: %w", err)
 	}
 
-	// rename tmp file to final file name
-	if err := lsFile.Close(); err != nil {
-		return fmt.Errorf("unable to close snapshot file: %w", err)
-	}
-	if err := os.Rename(filePathTmp, filePath); err != nil {
-		return fmt.Errorf("unable to rename temp snapshot file: %w", err)
+	// finalize file
+	if err := s.renameTempFile(snapshotFile, tempFilePath, filePath); err != nil {
+		return err
 	}
 
 	if writeToDatabase {
 		/*
 			// ToDo: Do we still store the initial snapshot in the database, or will the last full snapshot file be kept somewhere on disk?
-
 			// This has to be done before acquiring the SolidEntryPoints Lock, otherwise there is a race condition with "solidifyMilestone"
 			// In "solidifyMilestone" the LedgerLock is acquired, but by traversing the tangle, the SolidEntryPoint Lock is also acquired.
 			// ToDo: we should flush the caches here, just to be sure that all information before this snapshot we stored in the persistence layer.
@@ -515,13 +587,12 @@ func (s *Snapshot) createFullSnapshotWithoutLocking(targetIndex milestone.Index,
 		*/
 
 		snapshotInfo.SnapshotIndex = targetIndex
-		snapshotInfo.Timestamp = cachedTargetMilestone.GetMilestone().Timestamp
+		snapshotInfo.Timestamp = targetMsTimestamp
 		s.storage.SetSnapshotInfo(snapshotInfo)
-
 		s.tangle.Events.SnapshotMilestoneIndexChanged.Trigger(targetIndex)
 	}
 
-	s.log.Infof("created snapshot for target index %d, took %v", targetIndex, time.Since(ts))
+	s.log.Infof("created full snapshot for target index %d, took %v", targetIndex, time.Since(ts))
 	return nil
 }
 
@@ -659,7 +730,7 @@ func (s *Snapshot) LoadFullSnapshotFromFile(networkID uint64, filePath string) e
 	return nil
 }
 
-// HandleNewSolidMilestoneEvent handles new solid milestone events which may trigger a snapshot creation and pruning.
+// HandleNewSolidMilestoneEvent handles new solid milestone events which may trigger a delta snapshot creation and pruning.
 func (s *Snapshot) HandleNewSolidMilestoneEvent(solidMilestoneIndex milestone.Index, shutdownSignal <-chan struct{}) {
 	s.snapshotLock.Lock()
 	defer s.snapshotLock.Unlock()

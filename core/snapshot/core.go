@@ -111,7 +111,7 @@ func provide(c *dig.Container) {
 			deps.Storage,
 			deps.Tangle,
 			deps.UTXO,
-			deps.NodeConfig.String(CfgSnapshotsPath),
+			deps.NodeConfig.String(CfgSnapshotsFullPath),
 			SolidEntryPointCheckThresholdPast,
 			SolidEntryPointCheckThresholdFuture,
 			AdditionalPruningThreshold,
@@ -147,7 +147,7 @@ func configure() {
 		}
 	}
 
-	path := deps.NodeConfig.String(CfgSnapshotsPath)
+	path := deps.NodeConfig.String(CfgSnapshotsFullPath)
 	if path == "" {
 		log.Fatal(snapshot.ErrNoSnapshotSpecified.Error())
 	}
