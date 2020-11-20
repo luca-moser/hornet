@@ -112,6 +112,7 @@ func provide(c *dig.Container) {
 			deps.Tangle,
 			deps.UTXO,
 			deps.NodeConfig.String(CfgSnapshotsFullPath),
+			deps.NodeConfig.String(CfgSnapshotsDeltaPath),
 			SolidEntryPointCheckThresholdPast,
 			SolidEntryPointCheckThresholdFuture,
 			AdditionalPruningThreshold,

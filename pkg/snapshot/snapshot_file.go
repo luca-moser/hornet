@@ -46,6 +46,12 @@ const (
 	Delta
 )
 
+// maps the snapshot type to its name.
+var snapshotNames = map[Type]string{
+	Full:  "full",
+	Delta: "delta",
+}
+
 // Output defines an output within a snapshot.
 type Output struct {
 	// The message ID of the message that contained the transaction where this output was created.
