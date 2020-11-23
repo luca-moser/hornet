@@ -34,7 +34,7 @@ var (
 	ErrFinalLedgerIndexDoesNotMatchSEPIndex = errors.New("final ledger index does not match solid entry point index")
 
 	ErrNoSnapshotSpecified                   = errors.New("no snapshot file was specified in the config")
-	ErrNoSnapshotDownloadURL                 = errors.New("no download URL given for snapshot in config")
+	ErrNoSnapshotDownloadURL                 = errors.New("no download URL specified for snapshot files in config")
 	ErrSnapshotDownloadWasAborted            = errors.New("snapshot download was aborted")
 	ErrSnapshotDownloadNoValidSource         = errors.New("no valid source found, snapshot download not possible")
 	ErrSnapshotImportWasAborted              = errors.New("snapshot import was aborted")
@@ -448,10 +448,10 @@ func (s *Snapshot) msDiffProducerDeltaFileAndDatabase(ledgerIndex milestone.Inde
 
 	var prevDeltaMsDiffProducerFinished bool
 	var prevDeltaUpToIndex milestone.Index
-	var dbMilestoneProducer MilestoneDiffProducerFunc
+	var dbMsDiffProducer MilestoneDiffProducerFunc
 	return func() (*MilestoneDiff, error) {
 		if prevDeltaMsDiffProducerFinished {
-			return dbMilestoneProducer()
+			return dbMsDiffProducer()
 		}
 
 		// consume existing delta snapshot data
@@ -468,8 +468,8 @@ func (s *Snapshot) msDiffProducerDeltaFileAndDatabase(ledgerIndex milestone.Inde
 		// TODO: check whether previous snapshot already hit the target index?
 
 		prevDeltaMsDiffProducerFinished = true
-		dbMilestoneProducer = s.msDiffProducer(MsDiffDirectionOnwards, prevDeltaUpToIndex, targetIndex)
-		return dbMilestoneProducer()
+		dbMsDiffProducer = s.msDiffProducer(MsDiffDirectionOnwards, prevDeltaUpToIndex, targetIndex)
+		return dbMsDiffProducer()
 	}, nil
 }
 
@@ -605,25 +605,28 @@ func (s *Snapshot) readLSMLedgerIndex() (milestone.Index, error) {
 	return ledgerMilestoneIndex, nil
 }
 
-// reads out the ledger milestone index from the full snapshot file.
-func (s *Snapshot) readLedgerIndexFromFullSnapshotFile() (milestone.Index, error) {
+// reads out the snapshot milestone index from the full snapshot file.
+func (s *Snapshot) readSnapshotIndexFromFullSnapshotFile() (milestone.Index, error) {
 	lsFile, err := os.Open(s.snapshotFullPath)
 	if err != nil {
-		return 0, fmt.Errorf("unable to open full snapshot file for origin ledger milestone index: %w", err)
+		return 0, fmt.Errorf("unable to open full snapshot file for origin snapshot milestone index: %w", err)
 	}
 	defer lsFile.Close()
 
-	var originLedgerIndex milestone.Index
+	var originSnapshotIndex milestone.Index
 	var wantedAbort = errors.New("wanted abort")
 
 	if err := StreamSnapshotDataFrom(lsFile, func(header *ReadFileHeader) error {
-		originLedgerIndex = header.LedgerMilestoneIndex
+		// note that a full snapshot contains the ledger to the lsmi of the node which generated it,
+		// however, the state is rolled backed to the snapshot index, therefore, the snapshot index
+		// is the actual point from which on the delta snapshot should contain milestone diffs
+		originSnapshotIndex = header.SEPMilestoneIndex
 		return wantedAbort
 	}, nil, nil, nil); err != nil && !errors.Is(err, wantedAbort) {
-		return 0, fmt.Errorf("unable to read full snapshot file for origin ledger milestone index: %w", err)
+		return 0, fmt.Errorf("unable to read full snapshot file for origin snapshot milestone index: %w", err)
 	}
 
-	return originLedgerIndex, nil
+	return originSnapshotIndex, nil
 }
 
 // creates the temp file into which to write the snapshot data into.
@@ -714,14 +717,14 @@ func (s *Snapshot) createSnapshotWithoutLocking(snapshotType Type, targetIndex m
 		milestoneDiffProducer = s.msDiffProducer(MsDiffDirectionBackwards, header.LedgerMilestoneIndex, targetIndex)
 
 	case Delta:
-		// ledger index corresponds to the origin full snapshot ledger.
+		// ledger index corresponds to the origin snapshot snapshot ledger.
 		// this will return an error if the full snapshot file is not available
-		header.LedgerMilestoneIndex, err = s.readLedgerIndexFromFullSnapshotFile()
+		header.LedgerMilestoneIndex, err = s.readSnapshotIndexFromFullSnapshotFile()
 		if err != nil {
 			return err
 		}
 
-		// a delta snapshot contains the milestone diffs from a full snapshot's ledger index onwards to the snapshot index
+		// a delta snapshot contains the milestone diffs from a full snapshot's snapshot index onwards
 		switch {
 		case snapshotInfo.PruningIndex < header.LedgerMilestoneIndex:
 			// we have the needed milestone diffs in the database
@@ -769,47 +772,9 @@ func (s *Snapshot) createSnapshotWithoutLocking(snapshotType Type, targetIndex m
 	return nil
 }
 
-// LoadFullSnapshotFromFile loads a full snapshot file from the given file path into the storage.
-func (s *Snapshot) LoadFullSnapshotFromFile(networkID uint64, filePath string) error {
-	s.log.Info("importing full snapshot file...")
-	ts := time.Now()
-
-	lsFile, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("unable to open snapshot file for import: %w", err)
-	}
-	defer lsFile.Close()
-
-	var lsHeader *ReadFileHeader
-	headerConsumer := func(header *ReadFileHeader) error {
-		if header.Version != SupportedFormatVersion {
-			return errors.Wrapf(ErrUnsupportedSnapshot, "snapshot file version is %d but this HORNET version only supports %v", header.Version, SupportedFormatVersion)
-		}
-		if header.NetworkID != networkID {
-			return errors.Wrapf(ErrUnsupportedSnapshot, "snapshot file network ID is %d but this HORNET is meant for %d", header.NetworkID, networkID)
-		}
-
-		lsHeader = header
-		s.log.Infof("solid entry points: %d, outputs: %d, ms diffs: %d", header.SEPCount, header.OutputCount, header.MilestoneDiffCount)
-
-		if err := s.utxo.StoreLedgerIndex(lsHeader.LedgerMilestoneIndex); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	// note that we only get the hash of the SEP message instead
-	// of also its associated oldest cone root index, since the index
-	// of the snapshot milestone will be below max depth anyway.
-	// this information was included in pre Chrysalis Phase 2 snapshots
-	// but has been deemed unnecessary for the reason mentioned above.
-	sepConsumer := func(solidEntryPointMessageID *hornet.MessageID) error {
-		s.storage.SolidEntryPointsAdd(solidEntryPointMessageID, lsHeader.SEPMilestoneIndex)
-		return nil
-	}
-
-	outputConsumer := func(output *Output) error {
+// returns an output consumer storing them into the database.
+func (s *Snapshot) outputConsumer() OutputConsumerFunc {
+	return func(output *Output) error {
 		switch addr := output.Address.(type) {
 		case *iotago.WOTSAddress:
 			return iotago.ErrWOTSNotImplemented
@@ -823,37 +788,65 @@ func (s *Snapshot) LoadFullSnapshotFromFile(networkID uint64, filePath string) e
 			return iotago.ErrUnknownAddrType
 		}
 	}
+}
 
-	msDiffConsumer := func(msDiff *MilestoneDiff) error {
+// returns a function which calls the corresponding address type callback function with
+// the origin argument and type casted address.
+func callbackPerAddress(
+	wotsAddrF func(interface{}, *iotago.WOTSAddress) error,
+	edAddrF func(interface{}, *iotago.Ed25519Address) error) func(interface{}, iotago.Serializable) error {
+	return func(obj interface{}, addr iotago.Serializable) error {
+		switch a := addr.(type) {
+		case *iotago.WOTSAddress:
+			return wotsAddrF(obj, a)
+		case *iotago.Ed25519Address:
+			return edAddrF(obj, a)
+		default:
+			return iotago.ErrUnknownAddrType
+		}
+	}
+}
+
+// returns a iota.ErrWOTSNotImplemented error if called.
+func errorOnWOTSAddr(_ interface{}, _ *iotago.WOTSAddress) error {
+	return iotago.ErrWOTSNotImplemented
+}
+
+// creates a milestone diff consumer storing them into the database.
+// if the ledger index within the database equals the produced milestone diff's index,
+// then its changes are roll-backed, otherwise, if the index is higher than the ledger index,
+// its mutations are applied on top of the latest state.
+// the caller needs to make sure to set the ledger index accordingly beforehand.
+func (s *Snapshot) msDiffConsumer() MilestoneDiffConsumerFunc {
+	return func(msDiff *MilestoneDiff) error {
 		var newOutputs []*utxo.Output
 		var newSpents []*utxo.Spent
 
+		createdOutputAggr := callbackPerAddress(errorOnWOTSAddr, func(obj interface{}, addr *iotago.Ed25519Address) error {
+			output := obj.(*Output)
+			outputID := iotago.UTXOInputID(output.OutputID)
+			messageID := hornet.MessageID(output.MessageID)
+			newOutputs = append(newOutputs, utxo.GetOutput(&outputID, &messageID, addr, output.Amount))
+			return nil
+		})
+
 		for _, output := range msDiff.Created {
-			switch addr := output.Address.(type) {
-			case *iotago.WOTSAddress:
-				return iotago.ErrWOTSNotImplemented
-			case *iotago.Ed25519Address:
-
-				outputID := iotago.UTXOInputID(output.OutputID)
-				messageID := hornet.MessageID(output.MessageID)
-
-				newOutputs = append(newOutputs, utxo.GetOutput(&outputID, &messageID, addr, output.Amount))
-			default:
-				return iotago.ErrUnknownAddrType
+			if err := createdOutputAggr(output, output.Address); err != nil {
+				return err
 			}
 		}
 
-		for _, spent := range msDiff.Consumed {
-			switch addr := spent.Address.(type) {
-			case *iotago.WOTSAddress:
-				return iotago.ErrWOTSNotImplemented
-			case *iotago.Ed25519Address:
-				outputID := iotago.UTXOInputID(spent.OutputID)
-				messageID := hornet.MessageID(spent.MessageID)
+		spentOutputAggr := callbackPerAddress(errorOnWOTSAddr, func(obj interface{}, addr *iotago.Ed25519Address) error {
+			spent := obj.(*Spent)
+			outputID := iotago.UTXOInputID(spent.OutputID)
+			messageID := hornet.MessageID(spent.MessageID)
+			newSpents = append(newSpents, utxo.NewSpent(utxo.GetOutput(&outputID, &messageID, addr, spent.Amount), &spent.TargetTransactionID, msDiff.MilestoneIndex))
+			return nil
+		})
 
-				newSpents = append(newSpents, utxo.NewSpent(utxo.GetOutput(&outputID, &messageID, addr, spent.Amount), &spent.TargetTransactionID, msDiff.MilestoneIndex))
-			default:
-				return iotago.ErrUnknownAddrType
+		for _, spent := range msDiff.Consumed {
+			if err := spentOutputAggr(spent, spent.Address); err != nil {
+				return err
 			}
 		}
 
@@ -862,28 +855,87 @@ func (s *Snapshot) LoadFullSnapshotFromFile(networkID uint64, filePath string) e
 			return err
 		}
 
-		if ledgerIndex == msDiff.MilestoneIndex {
+		switch {
+		case ledgerIndex == msDiff.MilestoneIndex:
 			return s.utxo.RollbackConfirmation(msDiff.MilestoneIndex, newOutputs, newSpents)
-		}
-
-		if ledgerIndex == msDiff.MilestoneIndex+1 {
+		case ledgerIndex+1 == msDiff.MilestoneIndex:
 			return s.utxo.ApplyConfirmation(msDiff.MilestoneIndex, newOutputs, newSpents)
+		default:
+			return ErrWrongMilestoneDiffIndex
+		}
+	}
+}
+
+// returns a file header consumer, which stores the ledger milestone index up on execution in the database.
+// the given targetHeader is populated with the value of the read file header.
+func (s *Snapshot) fileHeaderConsumer(wantedNetworkID uint64, wantedType Type, targetHeader *ReadFileHeader) HeaderConsumerFunc {
+	return func(header *ReadFileHeader) error {
+		if header.Version != SupportedFormatVersion {
+			return errors.Wrapf(ErrUnsupportedSnapshot, "snapshot file version is %d but this HORNET version only supports %v", header.Version, SupportedFormatVersion)
 		}
 
-		return ErrWrongMilestoneDiffIndex
+		if header.Type != wantedType {
+			return errors.Wrapf(ErrUnsupportedSnapshot, "snapshot file is of type %s but expected was %d", snapshotNames[header.Type], snapshotNames[wantedType])
+		}
+
+		if header.NetworkID != wantedNetworkID {
+			return errors.Wrapf(ErrUnsupportedSnapshot, "snapshot file network ID is %d but this HORNET is meant for %d", header.NetworkID, wantedNetworkID)
+		}
+
+		*targetHeader = *header
+		s.log.Infof("solid entry points: %d, outputs: %d, ms diffs: %d", header.SEPCount, header.OutputCount, header.MilestoneDiffCount)
+
+		if err := s.utxo.StoreLedgerIndex(header.LedgerMilestoneIndex); err != nil {
+			return err
+		}
+
+		return nil
 	}
+}
+
+// returns a solid entry point consumer which stores them into the database.
+// the SEPs are stored with the corresponding SEP milestone index from the snapshot.
+func (s *Snapshot) sepConsumer(header *ReadFileHeader) SEPConsumerFunc {
+	// note that we only get the hash of the SEP message instead
+	// of also its associated oldest cone root index, since the index
+	// of the snapshot milestone will be below max depth anyway.
+	// this information was included in pre Chrysalis Phase 2 snapshots
+	// but has been deemed unnecessary for the reason mentioned above.
+	return func(solidEntryPointMessageID *hornet.MessageID) error {
+		s.storage.SolidEntryPointsAdd(solidEntryPointMessageID, header.SEPMilestoneIndex)
+		return nil
+	}
+}
+
+// LoadSnapshotFromFile loads a snapshot file from the given file path into the storage.
+func (s *Snapshot) LoadSnapshotFromFile(snapshotType Type, networkID uint64, filePath string) error {
+	s.log.Infof("importing %s snapshot file...", snapshotNames[snapshotType])
+	ts := time.Now()
 
 	s.storage.WriteLockSolidEntryPoints()
 	s.storage.ResetSolidEntryPoints()
 	defer s.storage.WriteUnlockSolidEntryPoints()
 	defer s.storage.StoreSolidEntryPoints()
 
+	lsFile, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("unable to open %s snapshot file for import: %w", snapshotNames[snapshotType], err)
+	}
+	defer lsFile.Close()
+
+	header := &ReadFileHeader{}
+	headerConsumer := s.fileHeaderConsumer(networkID, snapshotType, header)
+	sepConsumer := s.sepConsumer(header)
+	var outputConsumer OutputConsumerFunc
+	if snapshotType == Full {
+		outputConsumer = s.outputConsumer()
+	}
+	msDiffConsumer := s.msDiffConsumer()
 	if err := StreamSnapshotDataFrom(lsFile, headerConsumer, sepConsumer, outputConsumer, msDiffConsumer); err != nil {
-		return fmt.Errorf("unable to import snapshot file: %w", err)
+		return fmt.Errorf("unable to import %s snapshot file: %w", snapshotNames[snapshotType], err)
 	}
 
-	s.log.Infof("imported snapshot file, took %v", time.Since(ts))
-
+	s.log.Infof("imported %s snapshot file, took %v", time.Since(ts), snapshotNames[snapshotType])
 	if err := s.utxo.CheckLedgerState(); err != nil {
 		return err
 	}
@@ -893,12 +945,12 @@ func (s *Snapshot) LoadFullSnapshotFromFile(networkID uint64, filePath string) e
 		return err
 	}
 
-	if ledgerIndex != lsHeader.SEPMilestoneIndex {
-		return errors.Wrapf(ErrFinalLedgerIndexDoesNotMatchSEPIndex, "%d != %d", ledgerIndex, lsHeader.SEPMilestoneIndex)
+	if ledgerIndex != header.SEPMilestoneIndex {
+		return errors.Wrapf(ErrFinalLedgerIndexDoesNotMatchSEPIndex, "%d != %d", ledgerIndex, header.SEPMilestoneIndex)
 	}
 
-	s.storage.SetSnapshotMilestone(lsHeader.NetworkID, lsHeader.SEPMilestoneIndex, lsHeader.SEPMilestoneIndex, lsHeader.SEPMilestoneIndex, time.Now())
-	s.storage.SetSolidMilestoneIndex(lsHeader.SEPMilestoneIndex, false)
+	s.storage.SetSnapshotMilestone(header.NetworkID, header.SEPMilestoneIndex, header.SEPMilestoneIndex, header.SEPMilestoneIndex, time.Now())
+	s.storage.SetSolidMilestoneIndex(header.SEPMilestoneIndex, false)
 
 	return nil
 }
